@@ -1,0 +1,228 @@
+import { MANUAL_CONNECTOR_ID } from "../api/manual-transactions";
+import type { ActivityItem } from "./types";
+import { compareActivityItems, isActivityDateTime } from "./list";
+import {
+  invoiceTransactionDayGap,
+  matchTradesToSettlements,
+  type MatchingTransaction,
+  type MatchingInvoice,
+  type InvoiceTransactionMatches,
+} from "./matching";
+export interface ActivityAccount {
+  id: string;
+  institutionName?: string | null;
+  accountName?: string | null;
+  accountType?: string | null;
+  accountLast4?: string | null;
+}
+export interface ActivityTransaction extends MatchingTransaction {
+  accountId: string;
+  institutionName?: string | null;
+  accountName?: string | null;
+  accountLast4?: string | null;
+  status: string;
+  excludedFromCalculation?: boolean;
+  note?: string | null;
+  classification?: {
+    label: string;
+    categoryId: string;
+    source: ActivityItem["classificationSource"];
+    ruleId?: string;
+    refund?: boolean;
+  };
+}
+export interface ActivityInvoice extends MatchingInvoice {
+  sellerName?: string | null;
+  invoiceNumber?: string | null;
+  /** 只在發票未配對交易時生效；配對後以交易的計算偏好為準。 */
+  excludedFromCalculation?: boolean;
+}
+export interface ActivityTrade {
+  id: string;
+  name?: string | null;
+  symbol?: string | null;
+  tradeDate?: string | null;
+  postedDate?: string | null;
+  transactionName?: string | null;
+  transactionCode?: string | null;
+  quantity?: number | null;
+  price?: number | null;
+  amount?: number | null;
+  currency: string;
+}
+const formatNumber = (value: number) =>
+  new Intl.NumberFormat("zh-TW", { maximumFractionDigits: 0 }).format(value);
+/** 將民國年 `0YYY-MM-DD` 轉成西元日期；其他格式原樣回傳。 */
+export function normalizeFinancialDate(value?: string) {
+  if (!value) return "";
+  const roc = value.match(/^0(\d{3})-(\d{2})-(\d{2})(.*)$/);
+  return roc ? `${Number(roc[1]) + 1911}-${roc[2]}-${roc[3]}${roc[4]}` : value;
+}
+export function buildActivityItems(
+  activityBankTransactions: ActivityTransaction[],
+  invoices: ActivityInvoice[],
+  trades: ActivityTrade[],
+  accounts: ReadonlyMap<string, ActivityAccount>,
+  invoiceMatches: InvoiceTransactionMatches<ActivityInvoice>,
+): ActivityItem[] {
+  const tradeDate = (t: ActivityTrade) =>
+    normalizeFinancialDate(t.tradeDate ?? t.postedDate ?? undefined);
+  // 集保以 1 占位的價格不是成交價，金額不可信，不拿來配交割款。
+  const tradeAmount = (t: ActivityTrade) =>
+    t.price === 1 ? undefined : (t.amount ?? undefined);
+  const tradeById = new Map(trades.map((t) => [t.id, t]));
+  const settlementToTrade = matchTradesToSettlements(
+    activityBankTransactions.map((t) => ({
+      ...t,
+      accountType: accounts.get(t.accountId)?.accountType ?? t.accountType,
+    })),
+    trades.map((t) => ({
+      id: t.id,
+      date: tradeDate(t),
+      amount: tradeAmount(t),
+      currency: t.currency,
+    })),
+  );
+  const settledTradeIds = new Set(settlementToTrade.values());
+  return [
+    ...activityBankTransactions.map((t) => {
+      const account = accounts.get(t.accountId);
+      const matchedInvoice = invoiceMatches.transactionToInvoice.get(t.id);
+      const settledTrade = tradeById.get(settlementToTrade.get(t.id) ?? "");
+      const trade = settledTrade && {
+        id: settledTrade.id,
+        name: settledTrade.name ?? settledTrade.symbol ?? "投資交易",
+        symbol: settledTrade.symbol ?? undefined,
+        date: tradeDate(settledTrade),
+        side:
+          settledTrade.transactionName ??
+          settledTrade.transactionCode ??
+          undefined,
+        quantity: settledTrade.quantity ?? undefined,
+        price: settledTrade.price ?? undefined,
+      };
+      const tradeLabel =
+        trade &&
+        [
+          trade.name,
+          trade.side,
+          trade.quantity != null
+            ? `${formatNumber(trade.quantity)} 股`
+            : undefined,
+        ]
+          .filter(Boolean)
+          .join(" ");
+      const isCard =
+        account?.accountType === "credit" || t.accountType === "credit";
+      const hasAuthorizationTime = isActivityDateTime(
+        t.authorizedAt ?? undefined,
+      );
+      // 跨日手動配對（如延後扣款）沿用扣款日期，月份統計與銀行帳務一致。
+      const invoiceTime =
+        matchedInvoice &&
+        isActivityDateTime(matchedInvoice.invoiceDate) &&
+        invoiceTransactionDayGap(t, matchedInvoice) === 0
+          ? matchedInvoice.invoiceDate
+          : undefined;
+      const institutionName =
+        t.institutionName ??
+        account?.institutionName ??
+        (isCard ? "信用卡" : "銀行");
+      const accountLast4 = t.accountLast4 ?? account?.accountLast4;
+      const accountName =
+        t.accountName ??
+        account?.accountName ??
+        (accountLast4 ? `末四碼 ${accountLast4}` : "");
+      return {
+        id: t.id,
+        source: isCard ? ("card" as const) : ("bank" as const),
+        date: invoiceTime ?? t.authorizedAt ?? t.postedDate ?? "",
+        dateHasTime: hasAuthorizationTime || invoiceTime != null,
+        title: t.description ?? t.counterparty ?? "銀行交易",
+        searchText: [
+          t.counterparty,
+          matchedInvoice?.sellerName,
+          matchedInvoice ? "電子發票" : undefined,
+          trade?.symbol,
+          trade ? "投資" : undefined,
+          accountLast4,
+          isCard ? "信用卡" : "銀行",
+          t.connectorId === MANUAL_CONNECTOR_ID ? "手動" : undefined,
+        ]
+          .filter(Boolean)
+          .join(" "),
+        subtitle: [
+          institutionName,
+          accountName,
+          matchedInvoice?.invoiceNumber,
+          tradeLabel,
+        ]
+          .filter(Boolean)
+          .join(" · "),
+        institutionName,
+        accountName,
+        amount: t.amount,
+        currency: t.currency,
+        category: t.classification?.label ?? "未分類",
+        categoryId: t.classification?.categoryId ?? "other",
+        classificationPattern: t.counterparty ?? t.description ?? undefined,
+        classificationSource: t.classification?.source ?? "fallback",
+        classificationRuleId: t.classification?.ruleId,
+        refund: t.classification?.refund,
+        transactionId: t.id,
+        manual: t.connectorId === MANUAL_CONNECTOR_ID ? true : undefined,
+        note: t.note ?? undefined,
+        invoiceId: matchedInvoice?.id,
+        invoiceAmount: matchedInvoice?.amount,
+        trade: trade || undefined,
+        excludedFromCalculation: t.excludedFromCalculation,
+        status: t.status,
+      };
+    }),
+    ...invoices
+      .filter((i) => !invoiceMatches.invoiceToTransactionId.has(i.id))
+      .map((i) => ({
+        id: i.id,
+        source: "invoice" as const,
+        date: i.invoiceDate,
+        dateHasTime: isActivityDateTime(i.invoiceDate),
+        title: i.sellerName ?? "電子發票",
+        subtitle: i.invoiceNumber ?? "",
+        institutionName: "電子發票",
+        accountName: i.invoiceNumber ?? "",
+        amount: i.amount,
+        currency: "TWD",
+        category: "發票",
+        invoiceId: i.id,
+        invoiceAmount: i.amount,
+        excludedFromCalculation: i.excludedFromCalculation,
+        status: "已開立",
+      })),
+    ...trades
+      .filter((t) => !settledTradeIds.has(t.id))
+      .map((t) => {
+        const accountName = [
+          t.transactionName ?? t.transactionCode,
+          t.quantity != null ? `${formatNumber(t.quantity)} 股` : undefined,
+        ]
+          .filter(Boolean)
+          .join(" · ");
+        return {
+          id: t.id,
+          source: "investment" as const,
+          date: tradeDate(t),
+          dateHasTime: false,
+          title: t.name ?? t.symbol ?? "投資交易",
+          searchText: t.symbol ?? undefined,
+          subtitle: accountName,
+          institutionName: "投資",
+          accountName,
+          amount: tradeAmount(t),
+          currency: t.currency,
+          category: "投資",
+          categoryId: "investment",
+          status: "已完成",
+        };
+      }),
+  ].sort(compareActivityItems);
+}

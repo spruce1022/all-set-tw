@@ -1,0 +1,558 @@
+import {
+  taipeiDateKey,
+  type SinotradeConnectionResponse,
+  type SinotradeVerificationInput,
+} from "@taiwan-fin-hub/shared";
+import {
+  acquireSyncJobLock,
+  releaseSyncJobLock,
+  type SyncTrigger,
+} from "../../db";
+import type { Env } from "../../platform/env";
+import type { SyncEnv } from "../../features/sync/execution";
+import { configEncryptionKey } from "../../platform/config";
+import { decryptJson, encryptJson } from "../../platform/crypto";
+import { requireConnectorSettings } from "../../features/sync/config";
+import { canonicalSyncLockRowId } from "../../features/sync/lock";
+import {
+  NeedsUserActionError,
+  SyncAlreadyRunningError,
+} from "../../features/sync/errors";
+import {
+  compareAndSetConnectorSecret,
+  connectorSettingsGuardStatement,
+  connectorEncryptedConfigStatement,
+} from "../../features/sync/connector-repository";
+import { persistStagedSyncWrite } from "../../features/sync/persistence";
+import {
+  investmentPositionRecord,
+  investmentTransactionRecord,
+  netWorthHistoryRecord,
+} from "../../features/sync/record-mapper";
+import type { SyncOutcome } from "../../features/sync/types";
+import type {
+  InvestmentPosition,
+  InvestmentTransaction,
+  NetWorthHistoryPoint,
+} from "../financial-types";
+import {
+  prepareSinotradeLogin,
+  completeSinotradeLogin,
+  closeSinotradeLogin,
+  captureSinotradeIssuedState,
+  fetchSinotradeSnapshot,
+  readSinotradeLoginChallenge,
+  verifySinotradeLogin,
+} from "./connector";
+import {
+  parseSinotradeConfig,
+  SinotradeLoginExpiredError,
+  SinotradeUnattendedLoginError,
+  type SinotradeConfig,
+  type SinotradePlatform,
+} from "./session-protocol";
+
+function reusableConfig(config: SinotradeConfig): SinotradeConfig {
+  return {
+    userId: config.userId,
+    password: config.password,
+    webState: config.webState,
+  };
+}
+
+async function withConnectionLock<T>(env: Env, task: () => Promise<T>) {
+  const lockRowId = canonicalSyncLockRowId("sinotrade");
+  const runId = crypto.randomUUID();
+  if (
+    !(await acquireSyncJobLock(env.DB, {
+      lockRowId,
+      scope: "all",
+      trigger: "manual",
+      runId,
+      leaseMs: 3 * 60_000,
+    }))
+  )
+    throw new SyncAlreadyRunningError("sinotrade");
+  try {
+    return await task();
+  } finally {
+    await releaseSyncJobLock(env.DB, lockRowId, runId);
+  }
+}
+
+async function loadConfig(env: Env) {
+  const settings = await requireConnectorSettings(env.DB, "sinotrade");
+  const config = parseSinotradeConfig(
+    await decryptJson(settings.encrypted_config, configEncryptionKey(env)),
+  );
+  return { settings, config };
+}
+
+export async function startSinotradeConnection(
+  env: Env,
+  platform: SinotradePlatform,
+) {
+  return withConnectionLock(env, async () => {
+    const { settings, config } = await loadConfig(env);
+    const prepared = await prepareSinotradeLogin(env.BROWSER, config, platform);
+    try {
+      await compareAndSetConnectorSecret(
+        env.DB,
+        "sinotrade",
+        settings,
+        await encryptJson(
+          {
+            ...config,
+            browserSessionId: prepared.browserSessionId,
+            browserSessionExpiresAt: prepared.expiresAt,
+            loginPlatform: platform,
+          },
+          configEncryptionKey(env),
+        ),
+        new Date().toISOString(),
+      );
+    } catch (error) {
+      await closeSinotradeLogin(env.BROWSER, {
+        browserSessionId: prepared.browserSessionId,
+      });
+      throw error;
+    }
+    return {
+      status: "verification_required" as const,
+      platform,
+      challenge: prepared.challenge,
+      expiresAt: prepared.expiresAt,
+    };
+  });
+}
+
+/**
+ * An expired login can no longer be completed; close its browser now instead of letting it idle
+ * until keep_alive ends, and forget the pending reference.
+ */
+async function expirePendingLogin(
+  env: Env,
+  settings: Awaited<ReturnType<typeof loadConfig>>["settings"],
+  config: SinotradeConfig,
+) {
+  await closeSinotradeLogin(env.BROWSER, config);
+  await compareAndSetConnectorSecret(
+    env.DB,
+    "sinotrade",
+    settings,
+    await encryptJson(reusableConfig(config), configEncryptionKey(env)),
+    new Date().toISOString(),
+  );
+}
+
+export async function finishSinotradeConnection(
+  env: Env,
+): Promise<SinotradeConnectionResponse> {
+  return withConnectionLock(env, async () => {
+    const { settings, config } = await loadConfig(env);
+    let completed: Awaited<ReturnType<typeof completeSinotradeLogin>>;
+    try {
+      completed = await completeSinotradeLogin(env.BROWSER, config);
+    } catch (error) {
+      if (error instanceof SinotradeLoginExpiredError)
+        await expirePendingLogin(env, settings, config);
+      throw error;
+    }
+    const pending = completed.pending;
+    try {
+      await compareAndSetConnectorSecret(
+        env.DB,
+        "sinotrade",
+        settings,
+        await encryptJson(
+          {
+            userId: config.userId,
+            password: config.password,
+            webState: completed.webState,
+            ...(pending
+              ? {
+                  browserSessionId: pending.browserSessionId,
+                  browserSessionExpiresAt: pending.expiresAt,
+                  loginPlatform: pending.platform,
+                }
+              : {}),
+          },
+          configEncryptionKey(env),
+        ),
+        new Date().toISOString(),
+      );
+    } catch (error) {
+      if (pending)
+        await closeSinotradeLogin(env.BROWSER, {
+          browserSessionId: pending.browserSessionId,
+        });
+      throw error;
+    }
+    if (pending)
+      return {
+        status: "verification_required",
+        platform: pending.platform,
+        challenge: pending.challenge,
+        expiresAt: pending.expiresAt,
+      };
+    return { success: true as const, status: "connected" as const };
+  });
+}
+
+export async function cancelSinotradeConnection(env: Env) {
+  return withConnectionLock(env, async () => {
+    const { settings, config } = await loadConfig(env);
+    await closeSinotradeLogin(env.BROWSER, config);
+    await compareAndSetConnectorSecret(
+      env.DB,
+      "sinotrade",
+      settings,
+      await encryptJson(reusableConfig(config), configEncryptionKey(env)),
+      new Date().toISOString(),
+    );
+    return { success: true as const };
+  });
+}
+
+export async function readSinotradeConnectionStatus(
+  env: Env,
+): Promise<SinotradeConnectionResponse> {
+  const { settings, config } = await loadConfig(env);
+  let challenge: Awaited<ReturnType<typeof readSinotradeLoginChallenge>>;
+  try {
+    challenge = await readSinotradeLoginChallenge(env.BROWSER, config);
+  } catch (error) {
+    // Best effort: the expiry, not a cleanup or concurrent-update failure, is what to report.
+    if (error instanceof SinotradeLoginExpiredError)
+      await expirePendingLogin(env, settings, config).catch(() => undefined);
+    throw error;
+  }
+  return {
+    status: "verification_required",
+    platform: config.loginPlatform!,
+    challenge,
+    expiresAt: config.browserSessionExpiresAt!,
+  };
+}
+
+/**
+ * Saves the issued certificate (with the login it enabled) as an unverified platform state, so
+ * a failure or a cancel later in the flow does not cost another OTP: the next connection
+ * restores it. Only `connect/complete` marks the platform as connected. Remembering is best
+ * effort and must never fail or hide the verification result.
+ */
+async function rememberIssuedCertificate(
+  env: Env,
+  settings: Awaited<ReturnType<typeof loadConfig>>["settings"],
+  config: SinotradeConfig,
+) {
+  const platform = config.loginPlatform;
+  if (!platform) return;
+  try {
+    const state = await captureSinotradeIssuedState(env.BROWSER, config);
+    if (!state) return;
+    const previous = config.webState?.[platform];
+    await compareAndSetConnectorSecret(
+      env.DB,
+      "sinotrade",
+      settings,
+      await encryptJson(
+        {
+          ...config,
+          webState: {
+            ...config.webState,
+            [platform]: {
+              ...state,
+              authenticated: previous ? previous.authenticated : false,
+            },
+          },
+        },
+        configEncryptionKey(env),
+      ),
+      new Date().toISOString(),
+    );
+  } catch {
+    // The verification already succeeded; `connect/complete` saves the state again.
+  }
+}
+
+export async function verifySinotradeConnection(
+  env: Env,
+  input: SinotradeVerificationInput,
+): Promise<SinotradeConnectionResponse> {
+  return withConnectionLock(env, async () => {
+    const { settings, config } = await loadConfig(env);
+    let challenge: Awaited<ReturnType<typeof verifySinotradeLogin>>;
+    try {
+      challenge = await verifySinotradeLogin(env.BROWSER, config, input);
+    } catch (error) {
+      if (error instanceof SinotradeLoginExpiredError)
+        await expirePendingLogin(env, settings, config).catch(() => undefined);
+      throw error;
+    }
+    // Agreeing to the terms issues the certificate; keep it now, whatever happens next.
+    if (input.action === "accept_terms" || challenge.step === "ready")
+      await rememberIssuedCertificate(env, settings, config);
+    return {
+      status: "verification_required",
+      platform: config.loginPlatform!,
+      challenge,
+      expiresAt: config.browserSessionExpiresAt!,
+    };
+  });
+}
+
+/**
+ * 自動重新登入沒有完成時，把該平台標記為未連線：之後的同步在送出帳密前就停止，直到使用者
+ * 重新連線，避免每天重送被拒絕的密碼。帳密與憑證保留，重新連線通常不必再收 OTP。標記是
+ * 盡力而為，不得蓋過原本的錯誤。
+ */
+async function forgetPlatformLogin(
+  env: SyncEnv,
+  settings: Awaited<ReturnType<typeof loadConfig>>["settings"],
+  config: SinotradeConfig,
+  platform: SinotradePlatform,
+) {
+  const state = config.webState?.[platform];
+  if (!state) return;
+  try {
+    await compareAndSetConnectorSecret(
+      env.DB,
+      "sinotrade",
+      settings,
+      await encryptJson(
+        {
+          ...reusableConfig(config),
+          webState: {
+            ...config.webState,
+            [platform]: { ...state, authenticated: false },
+          },
+        },
+        configEncryptionKey(env),
+      ),
+      new Date().toISOString(),
+    );
+  } catch {
+    // 設定已被更新（例如使用者正在重新連線）：以新的設定為準。
+  }
+}
+
+type SinotradePositionInput = Omit<InvestmentPosition, "id" | "connectorId">;
+
+async function loadRatesToTwd(
+  db: D1Database,
+  positions: SinotradePositionInput[],
+) {
+  const currencies = [
+    ...new Set(
+      positions
+        .map((position) => position.currency)
+        .filter((currency) => currency !== "TWD"),
+    ),
+  ];
+  if (currencies.length === 0) return {};
+  const { results } = await db
+    .prepare(
+      "SELECT currency, rate_to_twd FROM exchange_rates WHERE currency IN (SELECT value FROM json_each(?))",
+    )
+    .bind(JSON.stringify(currencies))
+    .all<{ currency: string; rate_to_twd: number }>();
+  return Object.fromEntries(
+    results.map((row) => [row.currency, row.rate_to_twd]),
+  );
+}
+
+function marketHistory(
+  positions: SinotradePositionInput[],
+  ratesToTwd: Readonly<Record<string, number>>,
+  date: string,
+  assetType: NonNullable<NetWorthHistoryPoint["assetType"]>,
+): NetWorthHistoryPoint | null {
+  if (positions.length === 0) return null;
+  let netWorth = 0;
+  for (const position of positions) {
+    const amount = position.marketValue ?? 0;
+    if (amount === 0) continue;
+    const rate =
+      position.currency === "TWD" ? 1 : ratesToTwd[position.currency];
+    if (rate === undefined) return null;
+    netWorth += amount * rate;
+  }
+  return { date, netWorth: Math.round(netWorth), assetType };
+}
+
+/**
+ * 資產走勢的股票歷史：台股帳戶寫 `tw_stock`，由走勢查詢與集保的台股市值合併（集保有資料的日期以集保為準，
+ * 避免重複）；海外帳戶以同步當下的匯率換算台幣寫 `stock`，集保沒有這部分，直接相加。
+ * 沒有該市場帳戶時不寫；全數賣出時寫 0，讓走勢不沿用舊值。缺少匯率時不寫，不以 0 或原幣代替。
+ */
+export function sinotradeStockHistory(
+  positions: SinotradePositionInput[],
+  ratesToTwd: Readonly<Record<string, number>>,
+  date: string,
+): NetWorthHistoryPoint[] {
+  return [
+    marketHistory(
+      positions.filter((position) => position.market === "TW"),
+      ratesToTwd,
+      date,
+      "tw_stock",
+    ),
+    marketHistory(
+      positions.filter(
+        (position) => position.market && position.market !== "TW",
+      ),
+      ratesToTwd,
+      date,
+      "stock",
+    ),
+  ].filter((point) => point !== null);
+}
+
+export async function syncSinotrade(
+  env: SyncEnv,
+  _trigger: SyncTrigger,
+): Promise<SyncOutcome> {
+  const { settings, config } = await loadConfig(env);
+  let snapshot: Awaited<ReturnType<typeof fetchSinotradeSnapshot>>;
+  try {
+    snapshot = await fetchSinotradeSnapshot(env.BROWSER, config);
+  } catch (error) {
+    if (error instanceof SinotradeUnattendedLoginError)
+      await forgetPlatformLogin(env, settings, config, error.platform);
+    throw error;
+  }
+  const now = new Date().toISOString();
+  const asOfDate = taipeiDateKey(new Date(now));
+  const positions: SinotradePositionInput[] = [];
+  const trades: Array<Omit<InvestmentTransaction, "id" | "connectorId">> = [];
+  for (const {
+    account,
+    holdings,
+    trades: accountTrades,
+  } of snapshot.accountHoldings) {
+    for (const trade of accountTrades)
+      trades.push({
+        accountId: `sinotrade:${account.market}:${account.brokerNo}:${account.brokerAccount}`,
+        sourceId: trade.key,
+        brokerNo: account.brokerNo,
+        brokerAccount: account.brokerAccount,
+        brokerName: "永豐金證券",
+        symbol: trade.symbol,
+        name: trade.name,
+        assetType:
+          trade.market === "TW" && trade.symbol.startsWith("00")
+            ? "etf"
+            : "stock",
+        tradeDate: trade.tradeDate,
+        transactionCode: trade.side,
+        transactionName: trade.side === "B" ? "買進" : "賣出",
+        quantity: trade.quantity,
+        price: trade.price,
+        amount: trade.amount,
+        realizedPnl: trade.realizedPnl,
+        currency: trade.currency,
+        raw: {
+          market: trade.market,
+          fee: trade.fee,
+          tax: trade.tax,
+          orderNo: trade.orderNo,
+          inventoryType: trade.inventoryType,
+          realizedCost: trade.realizedCost,
+        },
+      });
+    // Keep both asset scopes current even when every security in a scope was sold.
+    for (const assetType of ["stock", "etf"] as const)
+      positions.push({
+        sourceId: `empty:${account.market}:${account.brokerNo}:${account.brokerAccount}:${assetType}`,
+        ...account,
+        assetType,
+        name: "目前沒有持倉",
+        quantity: 0,
+        marketValue: 0,
+        currency: account.market === "TW" ? "TWD" : "USD",
+        asOfDate,
+        raw: { snapshotMarker: true },
+      });
+    for (const holding of holdings)
+      positions.push({
+        sourceId: `${account.market}:${account.brokerNo}:${account.brokerAccount}:${holding.symbol}`,
+        ...account,
+        assetType:
+          holding.market === "TW" && holding.symbol.startsWith("00")
+            ? "etf"
+            : "stock",
+        symbol: holding.symbol,
+        name: holding.name,
+        quantity: holding.quantity,
+        marketValue: holding.marketValue,
+        costBasis: holding.costBasis,
+        unrealizedPnl: holding.unrealizedPnl,
+        currency: holding.currency,
+        asOfDate,
+        raw: { market: holding.market, positionType: holding.positionType },
+      });
+  }
+  const stockHistory = sinotradeStockHistory(
+    positions,
+    await loadRatesToTwd(env.DB, positions),
+    asOfDate,
+  );
+  env.syncSignal?.throwIfAborted();
+  const newRecords = await persistStagedSyncWrite(env.DB, {
+    records: [
+      ...positions.map((position) =>
+        investmentPositionRecord("sinotrade", position, now),
+      ),
+      ...trades.map((trade) =>
+        investmentTransactionRecord("sinotrade", trade, now),
+      ),
+      ...stockHistory.map((point) =>
+        netWorthHistoryRecord("sinotrade", point, now),
+      ),
+    ],
+    beforePromoteStatements: [
+      connectorSettingsGuardStatement(
+        env.DB,
+        "sinotrade",
+        settings.encrypted_config,
+        settings.updated_at,
+      ),
+      env.DB.prepare(
+        "DELETE FROM investment_positions WHERE connector_id = ? AND as_of_date = ?",
+      ).bind("sinotrade", asOfDate),
+    ],
+    finalizeStatements: [
+      connectorEncryptedConfigStatement(
+        env.DB,
+        "sinotrade",
+        await encryptJson(
+          { ...reusableConfig(config), webState: snapshot.webState },
+          configEncryptionKey(env),
+        ),
+        null,
+        now,
+      ),
+    ],
+  }).catch(async (error: unknown) => {
+    const current = await requireConnectorSettings(env.DB, "sinotrade");
+    if (
+      current.encrypted_config !== settings.encrypted_config ||
+      current.updated_at !== settings.updated_at
+    )
+      throw new NeedsUserActionError("證券連線設定已變更，請重新同步。");
+    throw error;
+  });
+  return {
+    success: true,
+    connectorId: "sinotrade",
+    scope: "all",
+    records:
+      snapshot.accountHoldings.reduce(
+        (sum, item) => sum + item.holdings.length,
+        0,
+      ) + trades.length,
+    newRecords,
+    cursorUpdated: false,
+  };
+}
